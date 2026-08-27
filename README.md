@@ -18,9 +18,8 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 
 ## Auth
 
-Keyless to the caller. Data credentials are injected by the gateway
-(`injectSupabase: true` → `_supabaseUrl` / `_supabaseKey`); the pack itself is
-stateless and holds no secret.
+Keyless to the caller. The gateway injects the pack's data credentials per call;
+the pack itself is stateless and holds no secret.
 
 ## Relationship to the neighbouring packs
 
