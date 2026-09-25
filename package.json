@@ -1,20 +1,32 @@
 {
   "name": "@pipeworx/mcp-us-auctions",
-  "version": "0.1.0",
-  "description": "Live US auction lots and sold prices from commercial auction houses and government surplus",
+  "version": "0.1.1",
+  "description": "US Auctions MCP — every live US auction lot in the consolidated index,",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "bin": {
+    "mcp-us-auctions": "bin/cli.js"
+  },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "us-auctions"],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pipeworx-io/mcp-us-auctions"
+    "url": "git+https://github.com/pipeworx-io/mcp-us-auctions.git"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0"
+  },
   "devDependencies": {
-    "typescript": "^5.7.0"
+    "typescript": "^5.9.3",
+    "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-4e30bfe4aedaaaf0353eed91377fe0e38edd440cab6c1f67155e259e94529459",
+    "sourceCommit": "b0fb3c31386cf0256dcf1e2f1b3440435a87ec35"
   }
 }

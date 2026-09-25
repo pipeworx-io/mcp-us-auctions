@@ -1,9 +1,9 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.pipeworx-io/us-auctions",
-  "title": "US Auctions",
-  "description": "Live US auction lots and sold prices from commercial auction houses and government surplus",
-  "version": "0.1.0",
+  "title": "Us Auctions",
+  "description": "US Auctions MCP — every live US auction lot in the consolidated index,",
+  "version": "0.1.1",
   "websiteUrl": "https://pipeworx.io/packs/us-auctions",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-us-auctions",
