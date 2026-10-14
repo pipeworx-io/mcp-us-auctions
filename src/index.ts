@@ -874,6 +874,160 @@ const SOURCES: Array<{ source: string; segment: (typeof SEGMENTS)[number]; label
   { source: 'kbid', segment: 'commercial', label: 'K-BID — Minnesota & upper-Midwest affiliate auction companies' },
 ];
 
+// ── Source freshness (fleet #3065) ──────────────────────────────────────────
+//
+// A lot is "active" in auction_lots because the last pass that saw it said so.
+// When a source stops completing passes, nothing ever says otherwise: on
+// 2026-10-14 HiBid had not completed a pass for 20 days (Cloudflare egress
+// 403s), and its 1,060,867 "active" lots were 93% of the coverage headline and
+// most of every search result — lots last observed three weeks earlier, many
+// with no close time at all, presented as open.
+//
+// So a source is STALE when its last completed pass is older than STALE_AFTER
+// for its schedule, and stale sources' lots are WITHHELD from the open-lot
+// tools (search, closing_soon) rather than returned with a per-row flag. Why
+// withhold rather than mark: these tools' contract is "lots you can bid on
+// now", and a stale source's rows are not evidence of that — they may have
+// closed, sold, been withdrawn or re-dated since; a per-row `stale` flag is
+// advisory, and an agent assembling a list of open lots will drop the flag and
+// keep the row. Withholding is not silent: every response that withheld a
+// source names it, with its last_success_at, and us_auctions_coverage reports
+// it per source. Asked for a stale source by name, the tools say so rather than
+// return a clean zero.
+//
+// The thresholds are ~2x the observed pass cadence, NOT 2x the nominal
+// schedule. Measured on auction_runs: healthy HiBid (6h schedule) completed
+// passes 9.3-13.3h apart over its last 15 passes, so a 12h line would have
+// flapped stale on a working source half the time. Daily sources land 24-25h
+// apart (the due check fires an hour early and the pass then takes minutes to
+// hours).
+const STALE_AFTER_MS: Record<string, number> = {
+  '6h': 24 * 3600_000,
+  daily: 50 * 3600_000,
+  weekly: 15 * 24 * 3600_000,
+};
+
+interface SourceStateRow {
+  source: string;
+  schedule: string | null;
+  last_success_at: string | null;
+  consecutive_failures: number | null;
+  last_error: string | null;
+}
+
+export interface SourceFreshness {
+  source: string;
+  last_success_at: string | null;
+  stale: boolean;
+  stale_after_hours: number;
+  hours_since_success: number | null;
+  consecutive_failures: number;
+  last_error: string | null;
+}
+
+export function classifyFreshness(rows: SourceStateRow[], nowMs: number): Map<string, SourceFreshness> {
+  const out = new Map<string, SourceFreshness>();
+  for (const r of rows) {
+    const after = STALE_AFTER_MS[r.schedule ?? ''] ?? STALE_AFTER_MS.daily;
+    const t = r.last_success_at ? Date.parse(r.last_success_at) : NaN;
+    const age = Number.isFinite(t) ? nowMs - t : null;
+    out.set(r.source, {
+      source: r.source,
+      last_success_at: r.last_success_at,
+      // Never completed a pass is stale too: nothing it holds was confirmed.
+      stale: age === null || age > after,
+      stale_after_hours: after / 3600_000,
+      hours_since_success: age === null ? null : Math.round((age / 3600_000) * 10) / 10,
+      consecutive_failures: r.consecutive_failures ?? 0,
+      last_error: r.last_error ? r.last_error.slice(0, 200) : null,
+    });
+  }
+  return out;
+}
+
+// One small read (one row per source) per call, cached per isolate for a
+// minute: freshness moves on the scale of hours, and every search needs it.
+let freshnessCache: { at: number; map: Map<string, SourceFreshness> } | null = null;
+const FRESHNESS_TTL_MS = 60_000;
+
+async function sourceFreshness(cfg: SupabaseConfig): Promise<Map<string, SourceFreshness> | null> {
+  const now = Date.now();
+  if (freshnessCache && now - freshnessCache.at < FRESHNESS_TTL_MS) return freshnessCache.map;
+  try {
+    const rows = await pg<SourceStateRow[]>(
+      cfg,
+      'auction_sources',
+      'select=source,schedule,last_success_at,consecutive_failures,last_error&limit=200',
+    );
+    const map = classifyFreshness(rows, now);
+    freshnessCache = { at: now, map };
+    return map;
+  } catch {
+    // Cannot tell is not "fresh". The caller says so in the response.
+    return null;
+  }
+}
+
+function staleList(fresh: Map<string, SourceFreshness> | null): SourceFreshness[] {
+  return fresh ? [...fresh.values()].filter((f) => f.stale) : [];
+}
+
+function describeStale(f: SourceFreshness): string {
+  const when = f.last_success_at ? `last completed a refresh ${f.last_success_at} (${f.hours_since_success}h ago)` : 'has never completed a refresh';
+  return `${f.source} ${when}`;
+}
+
+/** The disclosure every open-lot response carries when a source was withheld. */
+function staleDisclosure(stale: SourceFreshness[], freshnessKnown: boolean) {
+  if (!freshnessKnown) {
+    return {
+      freshness_unverified:
+        'Could not read per-source refresh times, so lots below were NOT checked for staleness. Treat them as last-known listings and confirm on the auction page.',
+    };
+  }
+  if (stale.length === 0) return {};
+  return {
+    withheld_stale_sources: stale.map((f) => ({
+      source: f.source,
+      last_success_at: f.last_success_at,
+      hours_since_success: f.hours_since_success,
+      stale_after_hours: f.stale_after_hours,
+    })),
+    stale_note:
+      `Lots from ${stale.map(describeStale).join('; ')} are withheld: a source that has not refreshed within ` +
+      `${stale.map((f) => `${f.stale_after_hours}h`).join('/')} cannot vouch that its lots are still open. ` +
+      `Coverage for that source is missing from these results until it refreshes — see us_auctions_coverage.`,
+  };
+}
+
+/**
+ * Wrap an open-lot tool so stale sources are excluded at the QUERY (not just
+ * filtered after the LIMIT, which would shrink pages unpredictably) and the
+ * response names what was withheld.
+ */
+async function withFreshLots(
+  cfg: SupabaseConfig,
+  args: Record<string, unknown>,
+  run: (args: Record<string, unknown>) => Promise<Record<string, unknown>>,
+): Promise<Record<string, unknown>> {
+  const fresh = await sourceFreshness(cfg);
+  const stale = staleList(fresh);
+  const named = String(args.source ?? '').trim().toLowerCase();
+  const namedStale = named ? stale.find((f) => f.source === named) : undefined;
+  if (namedStale) {
+    return {
+      count: 0,
+      lots: [],
+      source_stale: true,
+      ...staleDisclosure([namedStale], true),
+      message: `No open lots can be reported for ${named}: it ${describeStale(namedStale).slice(named.length + 1)}, so its listings may have closed or changed since. This is a stale source, not an empty one.`,
+    };
+  }
+  const result = await run({ ...args, _exclude_sources: named ? [] : stale.map((f) => f.source) });
+  if ('error' in result) return result;
+  return { ...result, ...staleDisclosure(named ? [] : stale, fresh !== null) };
+}
+
 interface LotRow {
   source: string;
   source_lot_id: string;
@@ -1242,6 +1396,15 @@ function activeLotFilters(args: Record<string, unknown>): string[] {
   if (assetType) parts.push(`asset_type=eq.${encodeURIComponent(assetType)}`);
   const source = String(args.source ?? '').trim().toLowerCase();
   if (source) parts.push(`source=eq.${encodeURIComponent(source)}`);
+  // Stale sources (withFreshLots). Top-level `not.in` — no enclosing group for
+  // the commas to escape into (see soldComps' nested-filter note) — and the
+  // values are quoted anyway.
+  const exclude = Array.isArray(args._exclude_sources)
+    ? (args._exclude_sources as unknown[]).map(String).filter((x) => /^[a-z0-9-]+$/.test(x))
+    : [];
+  if (!source && exclude.length > 0) {
+    parts.push(`source=not.in.(${exclude.map((x) => encodeURIComponent(`"${x}"`)).join(',')})`);
+  }
   return parts;
 }
 
@@ -1309,9 +1472,15 @@ async function nearSearch(cfg: SupabaseConfig, args: Record<string, unknown>, zi
     p_max_price: args.max_price !== undefined && String(args.max_price).trim() !== '' ? Number(args.max_price) : null,
     p_limit: overFetch(clampInt(args.limit, 1, 100, 25)),
   });
-  const deduped = dedupeStorefronts(rows).slice(0, clampInt(args.limit, 1, 100, 25));
+  // search_auction_lots_near takes no source filter, so stale sources are
+  // dropped here, after the RPC's LIMIT — which can leave a short page. That is
+  // stated, rather than papered over by over-fetching an unknown multiple.
+  const exclude = new Set(Array.isArray(args._exclude_sources) ? (args._exclude_sources as unknown[]).map(String) : []);
+  const kept = rows.filter((r) => !exclude.has(r.source));
+  const deduped = dedupeStorefronts(kept).slice(0, clampInt(args.limit, 1, 100, 25));
   return {
     count: deduped.length,
+    ...(rows.length > kept.length ? { stale_rows_dropped: rows.length - kept.length } : {}),
     searched_around: { zip: c.zip, city: c.city, state: c.state, radius_miles: miles },
     distance_basis: 'Straight-line miles from the ZIP centroid of the lot\'s location to the ZIP centroid of the search point — town-level, not street-level.',
     lots: deduped.map((r) => ({
@@ -1803,21 +1972,38 @@ async function soldComps(cfg: SupabaseConfig, args: Record<string, unknown>) {
 }
 
 async function coverage(cfg: SupabaseConfig) {
-  const freshnessRows = await pg<Array<{ source: string; last_success_at: string | null }>>(
+  // Read directly (not through the 60s cache): coverage is the tool a caller
+  // uses to check freshness, so it should be as current as the row.
+  const freshnessRows = await pg<SourceStateRow[]>(
     cfg,
     'auction_sources',
-    'select=source,last_success_at&limit=200',
+    'select=source,schedule,last_success_at,consecutive_failures,last_error&limit=200',
   );
-  const freshness = new Map(freshnessRows.map((s) => [s.source, s.last_success_at]));
+  const freshness = classifyFreshness(freshnessRows, Date.now());
 
   const perSource = await Promise.all(
-    SOURCES.map(async (s) => ({
-      source: s.source,
-      segment: s.segment,
-      description: s.label,
-      active_lots: await pgCount(cfg, 'auction_lots', `status=eq.active&source=eq.${s.source}`),
-      last_refreshed_at: freshness.get(s.source) ?? null,
-    })),
+    SOURCES.map(async (s) => {
+      const f = freshness.get(s.source);
+      return {
+        source: s.source,
+        segment: s.segment,
+        description: s.label,
+        active_lots: await pgCount(cfg, 'auction_lots', `status=eq.active&source=eq.${s.source}`),
+        last_refreshed_at: f?.last_success_at ?? null,
+        last_success_at: f?.last_success_at ?? null,
+        // No state row at all is stale: the scraper has never reported it.
+        stale: f ? f.stale : true,
+        stale_after_hours: f?.stale_after_hours ?? STALE_AFTER_MS.daily / 3600_000,
+        hours_since_success: f?.hours_since_success ?? null,
+        ...(f && f.stale
+          ? {
+              consecutive_failures: f.consecutive_failures,
+              last_error: f.last_error,
+              stale_note: `Not counted in the active headline: ${describeStale(f)}. Its lots are withheld from us_auctions_search and us_auctions_closing_soon until it refreshes.`,
+            }
+          : {}),
+      };
+    }),
   );
 
   const [openEvents, soldComps, distinct] = await Promise.all([
@@ -1844,11 +2030,39 @@ async function coverage(cfg: SupabaseConfig) {
   // A source whose count timed out contributes nothing to the sum and is named
   // instead, so the total is explicitly a partial rather than a smaller number
   // presented as a complete one.
-  const uncounted = perSource.filter((s) => s.active_lots === null).map((s) => s.source);
-  const totalActive = perSource.reduce((s, c) => s + (c.active_lots ?? 0), 0);
+  const freshSources = perSource.filter((s) => !s.stale);
+  // Only FRESH sources can make total_active_lots partial; stale ones are out
+  // of it by design, counted or not.
+  const uncounted = freshSources.filter((s) => s.active_lots === null).map((s) => s.source);
+  const staleSources = perSource.filter((s) => s.stale);
+  const sum = (rows: typeof perSource) => rows.reduce((n, c) => n + (c.active_lots ?? 0), 0);
+  const totalActive = sum(freshSources);
+  // null, not 0, when a stale source's count timed out — same rule as pgCount.
+  const staleActive = staleSources.some((s) => s.active_lots === null) ? null : sum(staleSources);
   const d = distinct.ok ? distinct.rows[0] : undefined;
+  // De-duplicated count over FRESH sources only (fleet #3065). The RPC counts
+  // every active row; the only duplicates it removes are GovDeals/AllSurplus
+  // cross-listings. So: fresh sources' counts, minus the cross-listings only
+  // when both storefronts are fresh (if either is stale its rows are already
+  // out of the sum, and so are the duplicates).
+  const lsFresh = ['govdeals', 'allsurplus'].every((src) => freshSources.some((s) => s.source === src));
+  const freshUncounted = freshSources.some((s) => s.active_lots === null);
+  const distinctFresh =
+    d && !freshUncounted ? totalActive - (lsFresh ? Number(d.duplicate_rows) : 0) : null;
   return {
-    distinct_active_lots: d?.distinct_lots ?? null,
+    distinct_active_lots: distinctFresh,
+    ...(staleSources.length
+      ? {
+          distinct_active_lots_including_stale: d?.distinct_lots ?? null,
+          stale_active_lots: staleActive,
+          stale_sources: staleSources.map((s) => ({ source: s.source, last_success_at: s.last_success_at, active_lots: s.active_lots })),
+          stale_note:
+            `${staleSources.map((s) => s.source).join(', ')} ${staleSources.length === 1 ? 'has' : 'have'} not completed a refresh ` +
+            `within ${staleSources.map((s) => `${s.stale_after_hours}h`).join('/')}, so ${staleActive === null ? 'the (uncounted) lots' : `${staleActive.toLocaleString('en-US')} lots`} marked active there are ` +
+            `last-known listings, not confirmed open ones. They are excluded from distinct_active_lots, total_active_lots and the ` +
+            `segment totals, and withheld from search results. distinct_active_lots_including_stale is the old headline.`,
+        }
+      : {}),
     ...(distinct.ok
       ? {}
       : {
@@ -1869,8 +2083,8 @@ async function coverage(cfg: SupabaseConfig) {
         }
       : {}),
     cross_listed_lots: d?.duplicate_rows ?? null,
-    commercial_lots: perSource.filter((s) => s.segment === 'commercial').reduce((s, c) => s + (c.active_lots ?? 0), 0),
-    government_lots: perSource.filter((s) => s.segment === 'government').reduce((s, c) => s + (c.active_lots ?? 0), 0),
+    commercial_lots: sum(freshSources.filter((s) => s.segment === 'commercial')),
+    government_lots: sum(freshSources.filter((s) => s.segment === 'government')),
     open_auction_events: openEvents,
     sold_comps_retained: soldComps,
     ...(soldComps === null
@@ -1885,6 +2099,27 @@ async function coverage(cfg: SupabaseConfig) {
   };
 }
 
+/**
+ * Sales (events) and houses are calendar facts — "this house runs a sale on
+ * Oct 20" — which a stale listing is far likelier to still have right than a
+ * lot's open/closed state, so they are not withheld. But every event today
+ * comes from HiBid, so when HiBid is stale the caller must be told the sale
+ * calendar is as of its last refresh, not live.
+ */
+async function withStaleSaleNote(cfg: SupabaseConfig, result: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const fresh = await sourceFreshness(cfg);
+  if (!fresh) return { ...result, ...staleDisclosure([], false) };
+  const eventSources = ['hibid'];
+  const stale = eventSources.map((src) => fresh.get(src)).filter((f): f is SourceFreshness => !!f && f.stale);
+  if (stale.length === 0) return result;
+  return {
+    ...result,
+    data_as_of: stale.map((f) => ({ source: f.source, last_success_at: f.last_success_at, hours_since_success: f.hours_since_success })),
+    stale: true,
+    stale_note: `Sale listings here are as of ${stale.map(describeStale).join('; ')} — not live. Sales may have been added, rescheduled or cancelled since. Confirm on the auction page before relying on a date.`,
+  };
+}
+
 // Credentials arrive as injected args, not env — the gateway pack entry sets
 // injectSupabase: true and passes _supabaseUrl/_supabaseKey per call.
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -1896,13 +2131,13 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   const cfg: SupabaseConfig = { url: supabaseUrl, key: supabaseKey };
   switch (name) {
     case 'us_auctions_search':
-      return search(cfg, args);
+      return withFreshLots(cfg, args, (a) => search(cfg, a) as Promise<Record<string, unknown>>);
     case 'us_auctions_closing_soon':
-      return closingSoon(cfg, args);
+      return withFreshLots(cfg, args, (a) => closingSoon(cfg, a) as Promise<Record<string, unknown>>);
     case 'us_auction_events':
-      return events(cfg, args);
+      return withStaleSaleNote(cfg, (await events(cfg, args)) as Record<string, unknown>);
     case 'us_auction_houses':
-      return houses(cfg, args);
+      return withStaleSaleNote(cfg, (await houses(cfg, args)) as Record<string, unknown>);
     case 'us_auctions_sold_comps':
       return soldComps(cfg, args);
     case 'us_auctions_coverage':

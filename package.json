@@ -1,7 +1,7 @@
 {
   "name": "@pipeworx/mcp-us-auctions",
-  "version": "0.1.2",
-  "description": "US Auctions MCP — every live US auction lot in the consolidated index,",
+  "version": "0.1.3",
+  "description": "US Auctions MCP — every live US auction lot in the consolidated index, government AND commercial, read from auction_lots / auction_events (ingested by workers/auction-scraper) over PostgREST.",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-f769a5698a3b8c985e74fe15f60f787e4296cf349c803008740f4566fbe15f0d",
-    "sourceCommit": "66a0692f029179984440cef6938cba7fdd41d66d"
+    "sourceHash": "v1-7abf9b3729ca97c58c0aff756fc2d7efa781891681d123b6614f68b6aae145d4",
+    "sourceCommit": "4f465027cf3de54acf4976d8118ae3423a8ec9fa"
   }
 }
