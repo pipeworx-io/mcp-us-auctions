@@ -1971,6 +1971,66 @@ async function soldComps(cfg: SupabaseConfig, args: Record<string, unknown>) {
   };
 }
 
+/**
+ * Every count this tool serves, in ONE round trip, each carrying how it was
+ * obtained (fleet #3098).
+ *
+ * basis is the contract, and it never includes "estimated":
+ *   exact        counted during this call
+ *   exact_as_of  a real count, taken at as_of by the pooler refresh workflow
+ *   uncounted    n is null and we are saying so, rather than guessing
+ *
+ * Why there is no estimate tier at all, when planner estimates are the obvious
+ * cheap fix: `status` and `source` are strongly correlated in auction_lots (most
+ * govdeals rows are CLOSED), and the planner multiplies the two selectivities as
+ * though they were independent. Measured 2026-10-15 — allsurplus estimate
+ * 156,512 against an exact 29,852 (+424%), bid4assets 3,454 against 535 (+546%),
+ * sold comps 1,236,929 against 1,928,711 (-36%). A number that wrong does not
+ * become safe by being labelled; it becomes a plausible wrong answer, which is
+ * the one failure this pack exists to prevent.
+ */
+interface CountRow {
+  scope: string;
+  n: number | null;
+  basis: 'exact' | 'exact_as_of' | 'uncounted';
+  as_of: string | null;
+  compute_ms: number | null;
+}
+
+interface Counted {
+  n: number | null;
+  basis: CountRow['basis'];
+  as_of: string | null;
+}
+
+const UNCOUNTED: Counted = { n: null, basis: 'uncounted', as_of: null };
+
+/**
+ * How a derived figure (a sum, or a sum minus the overlap) was obtained. A total
+ * is only as exact as its weakest contributor, and it is NULL the moment any
+ * contributor is uncounted — a sum that silently skips a missing term is a
+ * smaller number presented as a complete one.
+ */
+function combine(parts: Counted[]): Counted {
+  if (parts.some((p) => p.n === null)) return UNCOUNTED;
+  const asOfs = parts.map((p) => p.as_of).filter((a): a is string => !!a);
+  return {
+    n: parts.reduce((t, p) => t + (p.n ?? 0), 0),
+    basis: parts.some((p) => p.basis === 'exact_as_of') ? 'exact_as_of' : 'exact',
+    // The oldest contributor dates the whole figure.
+    as_of: asOfs.length ? asOfs.sort()[0] : null,
+  };
+}
+
+/** Plain-English gloss, so a caller does not have to learn our vocabulary. */
+function describeBasis(c: Counted): string | null {
+  if (c.basis === 'exact') return null; // counted live this call; nothing to disclose
+  if (c.basis === 'uncounted') {
+    return 'UNCOUNTED, not zero: this count has never completed. Nothing here is an estimate, so no number is given rather than a wrong one.';
+  }
+  return `EXACT as of ${c.as_of} — a real count, not an estimate, taken then rather than now. Counting it live exceeds the 8s query budget (the table is >4M rows), so it is refreshed on a 3-hourly schedule.`;
+}
+
 async function coverage(cfg: SupabaseConfig) {
   // Read directly (not through the 60s cache): coverage is the tool a caller
   // uses to check freshness, so it should be as current as the row.
@@ -1981,119 +2041,136 @@ async function coverage(cfg: SupabaseConfig) {
   );
   const freshness = classifyFreshness(freshnessRows, Date.now());
 
-  const perSource = await Promise.all(
-    SOURCES.map(async (s) => {
-      const f = freshness.get(s.source);
-      return {
-        source: s.source,
-        segment: s.segment,
-        description: s.label,
-        active_lots: await pgCount(cfg, 'auction_lots', `status=eq.active&source=eq.${s.source}`),
-        last_refreshed_at: f?.last_success_at ?? null,
-        last_success_at: f?.last_success_at ?? null,
-        // No state row at all is stale: the scraper has never reported it.
-        stale: f ? f.stale : true,
-        stale_after_hours: f?.stale_after_hours ?? STALE_AFTER_MS.daily / 3600_000,
-        hours_since_success: f?.hours_since_success ?? null,
-        ...(f && f.stale
-          ? {
-              consecutive_failures: f.consecutive_failures,
-              last_error: f.last_error,
-              stale_note: `Not counted in the active headline: ${describeStale(f)}. Its lots are withheld from us_auctions_search and us_auctions_closing_soon until it refreshes.`,
-            }
-          : {}),
-      };
-    }),
-  );
+  // ONE call replaces 11 per-source count=exact requests plus
+  // auction_distinct_active_count(). Each of those carried its own 8s ceiling
+  // and its own chance to come back null, which is how all four headline
+  // numbers ended up null at once.
+  const counts = new Map<string, Counted>();
+  let countsError: string | null = null;
+  try {
+    for (const r of await rpc<CountRow[]>(cfg, 'auction_coverage_counts', {})) {
+      counts.set(r.scope, { n: r.n === null ? null : Number(r.n), basis: r.basis, as_of: r.as_of });
+    }
+  } catch (e: unknown) {
+    // Named, never swallowed. A coverage tool that quietly omits its headline
+    // reads as "not implemented yet" rather than "broken" — that is exactly how
+    // the timing-out RPC went unnoticed before fleet #3065.
+    countsError = e instanceof Error ? e.message : String(e);
+  }
+  const at = (scope: string): Counted => counts.get(scope) ?? UNCOUNTED;
 
-  const [openEvents, soldComps, distinct] = await Promise.all([
-    pgCount(cfg, 'auction_events', 'status=eq.active'),
-    pgCount(cfg, 'auction_lots', 'status=eq.closed&final_price=gt.0'),
-    // GovDeals and AllSurplus are two storefronts over one catalogue, so the
-    // per-source counts sum to more lots than exist. Reporting only the sum
-    // would overstate coverage by ~47%, and it did until this was added.
-    //
-    // The catch returns a REASON, not an empty array. It used to swallow the
-    // error and report distinct_active_lots: null, and that is exactly how the
-    // RPC timing out at 564k rows (57014) went unnoticed — a coverage tool
-    // silently omitting its headline number reads as "not implemented yet"
-    // rather than "broken". A null with no explanation is the failure mode this
-    // whole pack exists to avoid.
-    rpc<Array<{ total_rows: number; duplicate_rows: number; distinct_lots: number }>>(
-      cfg,
-      'auction_distinct_active_count',
-      {},
-    ).then((r) => ({ ok: true as const, rows: r }))
-      .catch((e: unknown) => ({ ok: false as const, error: e instanceof Error ? e.message : String(e) })),
+  const perSource = SOURCES.map((s) => {
+    const f = freshness.get(s.source);
+    const c = at(`source:${s.source}`);
+    const basisNote = describeBasis(c);
+    return {
+      source: s.source,
+      segment: s.segment,
+      description: s.label,
+      active_lots: c.n,
+      active_lots_basis: c.basis,
+      ...(c.as_of ? { active_lots_counted_at: c.as_of } : {}),
+      ...(basisNote ? { active_lots_note: basisNote } : {}),
+      last_refreshed_at: f?.last_success_at ?? null,
+      last_success_at: f?.last_success_at ?? null,
+      // No state row at all is stale: the scraper has never reported it.
+      stale: f ? f.stale : true,
+      stale_after_hours: f?.stale_after_hours ?? STALE_AFTER_MS.daily / 3600_000,
+      hours_since_success: f?.hours_since_success ?? null,
+      ...(f && f.stale
+        ? {
+            consecutive_failures: f.consecutive_failures,
+            last_error: f.last_error,
+            stale_note: `Not counted in the active headline: ${describeStale(f)}. Its lots are withheld from us_auctions_search and us_auctions_closing_soon until it refreshes.`,
+          }
+        : {}),
+    };
+  });
+
+  const openEvents = await pgCount(cfg, 'auction_events', 'status=eq.active');
+
+  const freshSources = perSource.filter((s) => !s.stale);
+  const staleSources = perSource.filter((s) => s.stale);
+  const countOf = (rows: typeof perSource) => rows.map((s) => at(`source:${s.source}`));
+  // Only FRESH sources can make the headline partial; stale ones are out of it
+  // by design, counted or not.
+  const uncounted = freshSources.filter((s) => s.active_lots === null).map((s) => s.source);
+
+  const totalActive = combine(countOf(freshSources));
+  const staleActive = combine(countOf(staleSources));
+  const crossListed = at('cross_listed');
+  const soldComps = at('sold_comps');
+
+  // GovDeals and AllSurplus are two storefronts over one catalogue, so the
+  // per-source counts sum to more lots than exist — reporting only the sum
+  // overstates coverage by ~47%. The overlap is subtracted only when BOTH
+  // storefronts are fresh: if either is stale its rows are already out of the
+  // sum, and so are the duplicates.
+  const lsFresh = ['govdeals', 'allsurplus'].every((src) => freshSources.some((s) => s.source === src));
+  const distinctFresh = lsFresh ? combine([totalActive, { ...crossListed, n: crossListed.n === null ? null : -crossListed.n }]) : totalActive;
+  // The old headline, which counts stale sources too.
+  const distinctIncludingStale = combine([
+    at('active_total'),
+    { ...crossListed, n: crossListed.n === null ? null : -crossListed.n },
   ]);
 
-  // A source whose count timed out contributes nothing to the sum and is named
-  // instead, so the total is explicitly a partial rather than a smaller number
-  // presented as a complete one.
-  const freshSources = perSource.filter((s) => !s.stale);
-  // Only FRESH sources can make total_active_lots partial; stale ones are out
-  // of it by design, counted or not.
-  const uncounted = freshSources.filter((s) => s.active_lots === null).map((s) => s.source);
-  const staleSources = perSource.filter((s) => s.stale);
-  const sum = (rows: typeof perSource) => rows.reduce((n, c) => n + (c.active_lots ?? 0), 0);
-  const totalActive = sum(freshSources);
-  // null, not 0, when a stale source's count timed out — same rule as pgCount.
-  const staleActive = staleSources.some((s) => s.active_lots === null) ? null : sum(staleSources);
-  const d = distinct.ok ? distinct.rows[0] : undefined;
-  // De-duplicated count over FRESH sources only (fleet #3065). The RPC counts
-  // every active row; the only duplicates it removes are GovDeals/AllSurplus
-  // cross-listings. So: fresh sources' counts, minus the cross-listings only
-  // when both storefronts are fresh (if either is stale its rows are already
-  // out of the sum, and so are the duplicates).
-  const lsFresh = ['govdeals', 'allsurplus'].every((src) => freshSources.some((s) => s.source === src));
-  const freshUncounted = freshSources.some((s) => s.active_lots === null);
-  const distinctFresh =
-    d && !freshUncounted ? totalActive - (lsFresh ? Number(d.duplicate_rows) : 0) : null;
+  const distinctNote = describeBasis(distinctFresh);
+  const soldNote = describeBasis(soldComps);
   return {
-    distinct_active_lots: distinctFresh,
+    distinct_active_lots: distinctFresh.n,
+    distinct_active_lots_basis: distinctFresh.basis,
+    ...(distinctFresh.as_of ? { distinct_active_lots_counted_at: distinctFresh.as_of } : {}),
+    ...(distinctNote ? { distinct_active_lots_note: distinctNote } : {}),
     ...(staleSources.length
       ? {
-          distinct_active_lots_including_stale: d?.distinct_lots ?? null,
-          stale_active_lots: staleActive,
-          stale_sources: staleSources.map((s) => ({ source: s.source, last_success_at: s.last_success_at, active_lots: s.active_lots })),
+          distinct_active_lots_including_stale: distinctIncludingStale.n,
+          distinct_active_lots_including_stale_basis: distinctIncludingStale.basis,
+          stale_active_lots: staleActive.n,
+          stale_sources: staleSources.map((s) => ({
+            source: s.source,
+            last_success_at: s.last_success_at,
+            active_lots: s.active_lots,
+            active_lots_basis: s.active_lots_basis,
+          })),
           stale_note:
             `${staleSources.map((s) => s.source).join(', ')} ${staleSources.length === 1 ? 'has' : 'have'} not completed a refresh ` +
-            `within ${staleSources.map((s) => `${s.stale_after_hours}h`).join('/')}, so ${staleActive === null ? 'the (uncounted) lots' : `${staleActive.toLocaleString('en-US')} lots`} marked active there are ` +
+            `within ${staleSources.map((s) => `${s.stale_after_hours}h`).join('/')}, so ${staleActive.n === null ? 'the (uncounted) lots' : `${staleActive.n.toLocaleString('en-US')} lots`} marked active there are ` +
             `last-known listings, not confirmed open ones. They are excluded from distinct_active_lots, total_active_lots and the ` +
             `segment totals, and withheld from search results. distinct_active_lots_including_stale is the old headline.`,
         }
       : {}),
-    ...(distinct.ok
-      ? {}
-      : {
-          distinct_active_lots_unavailable:
-            `Could not compute the de-duplicated lot count: ${distinct.error.slice(0, 160)}. ` +
-            `total_active_lots below counts GovDeals and AllSurplus rows separately and therefore ` +
-            `OVERSTATES the number of distinct items — treat it as an upper bound.`,
-        }),
-    total_active_lots: totalActive,
+    ...(countsError
+      ? {
+          counts_unavailable:
+            `Could not obtain lot counts: ${countsError.slice(0, 160)}. Every count below is null as a ` +
+            `result — null means UNCOUNTED, never zero.`,
+        }
+      : {}),
+    total_active_lots: totalActive.n,
+    total_active_lots_basis: totalActive.basis,
     ...(uncounted.length
       ? {
           total_active_lots_partial:
-            `Counts timed out for ${uncounted.join(', ')} — those sources are NOT empty, they are ` +
-            `uncounted, and they contribute 0 to total_active_lots. An exact count over a table this ` +
-            `size exceeds the statement timeout. Use us_auctions_search or us_auctions_closing_soon ` +
-            `to confirm a source is live.`,
+            `Counts are missing for ${uncounted.join(', ')} — those sources are NOT empty, they are ` +
+            `uncounted, so no total is given rather than one that silently omits them. Use ` +
+            `us_auctions_search or us_auctions_closing_soon to confirm a source is live.`,
           uncounted_sources: uncounted,
         }
       : {}),
-    cross_listed_lots: d?.duplicate_rows ?? null,
-    commercial_lots: sum(freshSources.filter((s) => s.segment === 'commercial')),
-    government_lots: sum(freshSources.filter((s) => s.segment === 'government')),
+    cross_listed_lots: crossListed.n,
+    commercial_lots: combine(countOf(freshSources.filter((s) => s.segment === 'commercial'))).n,
+    government_lots: combine(countOf(freshSources.filter((s) => s.segment === 'government'))).n,
     open_auction_events: openEvents,
-    sold_comps_retained: soldComps,
-    ...(soldComps === null
-      ? {
-          sold_comps_retained_unavailable:
-            'The exact count of retained sold comps timed out. Comps ARE retained — call ' +
-            'us_auctions_sold_comps to read them. null here means uncounted, not zero.',
-        }
-      : {}),
+    sold_comps_retained: soldComps.n,
+    sold_comps_retained_basis: soldComps.basis,
+    ...(soldComps.as_of ? { sold_comps_retained_counted_at: soldComps.as_of } : {}),
+    ...(soldNote ? { sold_comps_retained_note: soldNote } : {}),
+    counts_note:
+      'Every number here is EXACT — counted during this call (basis "exact") or a real count taken at ' +
+      'the stated time (basis "exact_as_of"). None is an estimate: a planner estimate on this table is ' +
+      '4-6x wrong because status and source are correlated, so an uncountable scope is reported as ' +
+      'null/"uncounted" instead. Scopes too large to count inside the 8s query budget are refreshed ' +
+      'every 3 hours.',
     sources: perSource,
     note: 'Commercial sources refresh every ~6 hours; government sources daily. GovDeals and AllSurplus are two storefronts over one catalogue, so per-source counts overlap — distinct_active_lots is the real number of items, and search results are de-duplicated. Closed lots are retained indefinitely, which is why sold prices are answerable at all; the auction sites themselves do not keep them.',
   };
