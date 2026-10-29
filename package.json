@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-us-auctions",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "US Auctions MCP — every live US auction lot in the consolidated index, government AND commercial, read from auction_lots / auction_events (ingested by workers/auction-scraper) over PostgREST.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-us-auctions": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "us-auctions"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-us-auctions.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/us-auctions",
   "pipeworx": {
-    "sourceHash": "v1-9b096083495422fb675bada3e8d2936d3cf4e4bd13c155e8d01454ac8788d6ca",
-    "sourceCommit": "29b0ba434db72d3275d2ef85fdacb3db32377ba7"
+    "mode": "gateway",
+    "slug": "us-auctions",
+    "gatewaySlug": "us-auctions",
+    "sourceHash": "v1-8f93f5b2d375cfbaf395b7a25ed63a0c6591520c2910fad0734b18094c84a5e2",
+    "sourceCommit": "98853f34516646cb7c4c1460f09249b262c0269e"
   }
 }

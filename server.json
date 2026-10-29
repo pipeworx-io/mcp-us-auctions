@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/us-auctions",
   "title": "Us Auctions",
   "description": "US Auctions MCP — every live US auction lot in the consolidated index, government AND commercial…",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "websiteUrl": "https://pipeworx.io/packs/us-auctions",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-us-auctions",
