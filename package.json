@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-us-auctions",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "US Auctions MCP — every live US auction lot in the consolidated index, government AND commercial, read from auction_lots / auction_events (ingested by workers/auction-scraper) over PostgREST.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "us-auctions",
     "gatewaySlug": "us-auctions",
-    "sourceHash": "v1-8f93f5b2d375cfbaf395b7a25ed63a0c6591520c2910fad0734b18094c84a5e2",
-    "sourceCommit": "98853f34516646cb7c4c1460f09249b262c0269e"
+    "sourceHash": "v1-cae439c71556e6fd415357eff812099fa8ce5981884ba6404321ad30dc3cb06e",
+    "sourceCommit": "ca52e7ed1e1ccad897c2da1b0fa105edc0bc3b2e"
   }
 }
